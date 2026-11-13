@@ -374,11 +374,33 @@ class HomeController extends Controller
             $expensesTodayV2 = DB::table('voucher_masters')->where('voucher_type', 'expense')->whereDate('date', \Carbon\Carbon::today())->sum('total_amount');
             $expensesToday = $expensesTodayV1 + $expensesTodayV2;
 
-            // Total Stock Valuation in Single SQL Query
-            $totalStockValue = DB::table('warehouse_stocks')
-                ->join('products', 'products.id', '=', 'warehouse_stocks.product_id')
-                ->selectRaw('COALESCE(SUM(warehouse_stocks.total_pieces * (CASE WHEN products.size_mode = "by_size" THEN COALESCE(products.pieces_per_m2, 0) * COALESCE(products.purchase_price_per_m2, 0) ELSE COALESCE(products.purchase_price_per_piece, 0) END)), 0) as total')
-                ->value('total') ?? 0;
+            // Total Stock Valuation (Supports both simple products and multi-variant pricing)
+            $reportingCtrl = app(\App\Http\Controllers\ReportingController::class);
+            $allProducts = \App\Models\Product::with(['warehouseStocks'])->get();
+            $totalStockValue = 0;
+
+            foreach ($allProducts as $p) {
+                $decoded = is_string($p->color) ? json_decode($p->color, true) : $p->color;
+                $hasVariants = (is_array($decoded) && count($decoded) > 0 && isset($decoded[0]['name']));
+
+                if ($hasVariants) {
+                    $variants = $reportingCtrl->getVariantStockBalances($p, 'all');
+                    foreach ($variants as $idx => $v) {
+                        $vPieces = (float)($v['stock'] ?? 0);
+                        if ($vPieces <= 0) continue;
+                        $rawV = $decoded[$idx] ?? [];
+                        $vPrice = (float)($rawV['purch_price'] ?? $p->purchase_price_per_piece);
+                        if ($vPrice <= 0) $vPrice = (float)$p->purchase_price_per_piece;
+                        $totalStockValue += ($vPieces * $vPrice);
+                    }
+                } else {
+                    $dashPrice = ($p->size_mode === 'by_size') 
+                        ? ((float)($p->pieces_per_m2 ?? 0) * (float)($p->purchase_price_per_m2 ?? 0)) 
+                        : (float)($p->purchase_price_per_piece ?? 0);
+                    $whTotalPieces = (float)$p->warehouseStocks->sum('total_pieces');
+                    $totalStockValue += ($whTotalPieces * $dashPrice);
+                }
+            }
 
             $vendorCount = DB::table('vendors')->count();
             $employeeCount = \Illuminate\Support\Facades\Schema::hasTable('hr_employees') ? DB::table('hr_employees')->count() : DB::table('users')->count();

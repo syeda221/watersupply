@@ -128,7 +128,7 @@ class ReportingController extends Controller
         return view('admin_panel.reporting.inventory_demand_report', compact('categories', 'brands', 'warehouses', 'units'));
     }
 
-        private function getVariantStockBalances($product, $warehouseId = 'all')
+    public function getVariantStockBalances($product, $warehouseId = 'all')
     {
         $dateFrom = null;
         $dateTo = null;
