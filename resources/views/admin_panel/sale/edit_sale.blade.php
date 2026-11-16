@@ -1654,14 +1654,30 @@
                         </div>
 
                         <div id="rvWrapper">
-                            <div class="rv-row">
-                                <select class="form-select rv-account" name="receipt_account_id[]">
-                                    @foreach ($accounts as $acc)
-                                        <option value="{{ $acc->id }}" {{ str_contains(strtolower($acc->title), 'cash') || str_contains(strtolower($acc->title), 'easypaisa') ? 'selected' : '' }}>{{ $acc->title }}</option>
-                                    @endforeach
-                                </select>
-                                <input type="number" step="0.01" class="form-control rv-amount" name="receipt_amount[]" placeholder="0.00">
-                            </div>
+                            @if (!empty($existingReceipts) && count($existingReceipts) > 0)
+                                @foreach ($existingReceipts as $idx => $rItem)
+                                    <div class="rv-row {{ $idx > 0 ? 'd-flex gap-2 align-items-center mb-2' : '' }}">
+                                        <select class="form-select rv-account" name="receipt_account_id[]" style="{{ $idx > 0 ? 'max-width:320px' : '' }}">
+                                            @foreach ($accounts as $acc)
+                                                <option value="{{ $acc->id }}" {{ $acc->id == $rItem['account_id'] ? 'selected' : '' }}>{{ $acc->title }}</option>
+                                            @endforeach
+                                        </select>
+                                        <input type="number" step="0.01" class="form-control rv-amount text-end" name="receipt_amount[]" value="{{ number_format($rItem['amount'], 2, '.', '') }}" placeholder="0.00" style="{{ $idx > 0 ? 'max-width:160px' : '' }}">
+                                        @if ($idx > 0)
+                                            <button type="button" class="btn btn-outline-danger btn-sm btnRemRV">&times;</button>
+                                        @endif
+                                    </div>
+                                @endforeach
+                            @else
+                                <div class="rv-row">
+                                    <select class="form-select rv-account" name="receipt_account_id[]">
+                                        @foreach ($accounts as $acc)
+                                            <option value="{{ $acc->id }}" {{ str_contains(strtolower($acc->title), 'cash') || str_contains(strtolower($acc->title), 'easypaisa') ? 'selected' : '' }}>{{ $acc->title }}</option>
+                                        @endforeach
+                                    </select>
+                                    <input type="number" step="0.01" class="form-control rv-amount" name="receipt_amount[]" placeholder="0.00">
+                                </div>
+                            @endif
                         </div>
 
                         <div class="mt-auto pt-3">
@@ -2564,6 +2580,7 @@
                 $('#walkinDiscountRs').val({{ Js::from((float) ($sale->total_extradiscount ?? 0)) }} || 0);
 
                 window.isEditModeLoading = false;
+                if (typeof window.recomputeReceipts === 'function') window.recomputeReceipts();
                 if (typeof updateGrandTotals === 'function') updateGrandTotals();
                 if (typeof refreshPostedState === 'function') refreshPostedState();
                 if (typeof refreshPcsCtnHeader === 'function') refreshPcsCtnHeader();

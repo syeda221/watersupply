@@ -93,7 +93,7 @@ class POSController extends Controller
                     ->get();
 
                 $variantItems = [];
-                $totalStockPieces = 0;
+                $totalStockPieces = ($p->size_mode === 'by_kg') ? (float) ($p->warehouseStocks->sum('total_pieces') ?? 0) : 0;
 
                 foreach ($variants as $v) {
                     $size = (isset($v['size']) && $v['size'] !== '-') ? " {$v['size']}" : '';
@@ -160,19 +160,34 @@ class POSController extends Controller
                         }
                     }
 
+<<<<<<< HEAD
+                    $vNet = max(0, $initial + $purchased - $sold + $returnedQty - $pReturned);
+
+=======
+                    $vWeightPerPiece = (float) ($v['weight_per_piece'] ?? 0);
+>>>>>>> 90637cd5e8d4dcf256b13f10f431242d3f0accff
                     if (isset($v['conv_factor']) && $p->size_mode === 'by_kg') {
                         $factor = (float) $v['conv_factor'];
+                        if ($factor <= 0 && $vWeightPerPiece > 0) {
+                            $factor = $vWeightPerPiece / 1000.0;
+                        }
                         $factor = $factor > 0 ? $factor : 1;
+                        if ($vWeightPerPiece <= 0 && $factor > 0 && $factor != 1.0) {
+                            $vWeightPerPiece = $factor * 1000.0;
+                        } elseif ($vWeightPerPiece <= 0 && $factor == 1.0) {
+                            $vWeightPerPiece = 1000.0;
+                        }
                         if ($factor == 1) {
-                            $vBalance = max(0, $totalStockPieces);
+                            $vBalance = $vNet;
+                            $totalStockPieces += $vBalance;
                         } else {
-                            $vBalance = (int) floor(max(0, $totalStockPieces) / $factor);
+                            $baseStock = $totalStockPieces > 0 ? $totalStockPieces : $vNet;
+                            $vBalance = (int) floor($baseStock / $factor);
                         }
                     } else {
-                        $vBalance = max(0, $initial + $purchased - $sold + $returnedQty - $pReturned);
+                        $vBalance = $vNet;
                         $totalStockPieces += $vBalance;
                     }
-
                     $vStockDisplay = $vBalance;
                     if (isset($v['conv_factor']) && $p->size_mode === 'by_kg') {
                         $factor = (float) $v['conv_factor'];
@@ -205,13 +220,16 @@ class POSController extends Controller
                         'color_val' => $v['color'] ?? '-',
                         'price' => $v['sale_price'] ?? $p->sale_price_per_piece ?? 0,
                         'wholesale_price' => $v['wholesale_price'] ?? $p->wholesale_price ?? 0,
-                        'weight_per_piece' => $v['weight_per_piece'] ?? $p->weight_per_piece ?? 0,
+                        'weight_per_piece' => $vWeightPerPiece,
                         'stock_pieces' => $vBalance,
                         'stock' => $vStockDisplay,
                         'variant_data' => base64_encode($variantJson)
                     ];
                 }
 
+                if ($totalStockPieces <= 0 && $p->warehouseStocks && $p->warehouseStocks->sum('total_pieces') > 0) {
+                    $totalStockPieces = (float) $p->warehouseStocks->sum('total_pieces');
+                }
                 $totalStockDisplay = $totalStockPieces;
                 if ((in_array($p->size_mode, ['by_cartons', 'by_bandal']) || $p->size_mode === 'by_size') && $ppb > 1) {
                     $boxes = floor($totalStockPieces / $ppb);

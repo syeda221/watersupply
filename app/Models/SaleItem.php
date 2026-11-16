@@ -13,6 +13,7 @@ class SaleItem extends Model
         'discount_percent', 'discount_amount',
         'color', 'total_pieces', 'loose_pieces',
         'price_per_piece', 'price_per_m2',
+        'size_mode', 'pieces_per_box', 'is_manual', 'vendor_id', 'purchase_price', 'product_name',
     ];
 
     public function sale()

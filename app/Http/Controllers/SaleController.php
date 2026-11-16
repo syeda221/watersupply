@@ -976,8 +976,39 @@ class SaleController extends Controller
         // 3. Reuse nextInvoiceNumber var for current invoice no (view expects this variable name)
         $nextInvoiceNumber = $sale->invoice_no;
 
+        // Fetch existing receipt vouchers / payments for this sale
+        $receiptVouchers = \App\Models\VoucherMaster::with('details')
+            ->where('voucher_type', \App\Models\VoucherMaster::TYPE_RECEIPT)
+            ->where('remarks', 'like', "%#{$sale->invoice_no}%")
+            ->get();
+
+        $existingReceipts = [];
+        $totalPaidExisting = 0;
+        foreach ($receiptVouchers as $rv) {
+            $debitDetails = $rv->details->where('debit', '>', 0);
+            foreach ($debitDetails as $det) {
+                $existingReceipts[] = [
+                    'account_id' => $det->account_id,
+                    'amount' => (float) $det->debit,
+                ];
+                $totalPaidExisting += (float) $det->debit;
+            }
+        }
+
+        if (empty($existingReceipts) && (float)($sale->cash ?? 0) > 0) {
+            $defaultAcc = $accounts->first();
+            $existingReceipts[] = [
+                'account_id' => $defaultAcc ? $defaultAcc->id : 1,
+                'amount' => (float) $sale->cash,
+            ];
+            $totalPaidExisting = (float) $sale->cash;
+        }
+
         // 4. Return the Edit Sale View
-        return view('admin_panel.sale.edit_sale', compact('warehouse', 'customer', 'nextInvoiceNumber', 'accounts', 'sale', 'recentProducts', 'allSeries', 'activePrefix'));
+        return view('admin_panel.sale.edit_sale', compact(
+            'warehouse', 'customer', 'nextInvoiceNumber', 'accounts', 'sale',
+            'recentProducts', 'allSeries', 'activePrefix', 'existingReceipts', 'totalPaidExisting'
+        ));
     }
 
     public function updatesale(Request $request, $id)
@@ -1390,6 +1421,7 @@ class SaleController extends Controller
                 $saleItem->brand_id = $brandId;
                 $saleItem->unit_id = $unitId;
                 $saleItem->size_mode = $sizeMode;
+                $saleItem->pieces_per_box = $ppb;
 
                 if ($isManual) {
                     $saleItem->is_manual = 1;
@@ -1656,6 +1688,10 @@ class SaleController extends Controller
                 \Log::info('Proceeding to Auto-Receipt & Ledger logic for Sale #'.$sale->invoice_no);
 
                 // 1. DEDUCT STOCK FROM WAREHOUSE
+                // CRUCIAL: Unset and reload items relation so that handleStockImpact uses the newly created items,
+                // not the old items cached during rollbackPostedSale!
+                $sale->unsetRelation('items');
+                $sale->load('items.product');
                 $this->handleStockImpact($sale, 'out');
 
                 $totalReturnVal = $totalReturnAmountForNet ?? 0;
@@ -2310,16 +2346,26 @@ class SaleController extends Controller
             if ($item->product && !empty($item->product->color)) {
                 $prodVariants = json_decode($item->product->color, true);
                 if (is_array($prodVariants)) {
+                    // 1. Match by barcode first
                     if (!empty($variant['barcode'])) {
                         $liveVariant = collect($prodVariants)->firstWhere('barcode', $variant['barcode']);
                     }
-                    if (!$liveVariant && !empty($variant['name'])) {
+                    // 2. Match by BOTH size and name (do NOT match name alone when size is specified!)
+                    if (!$liveVariant && !empty($variant['size']) && $variant['size'] !== '-') {
                         $liveVariant = collect($prodVariants)->first(function($v) use ($variant) {
-                            $n1 = strtolower(trim($v['name'] ?? ''));
-                            $n2 = strtolower(trim($variant['name'] ?? ''));
-                            return $n1 === $n2 || ($n1 && $n2 && (str_contains($n1, $n2) || str_contains($n2, $n1)));
+                            $s1 = strtolower(trim($v['size'] ?? ''));
+                            $s2 = strtolower(trim($variant['size'] ?? ''));
+                            $sizeMatches = ($s1 === $s2 || ($s1 && $s2 && (str_starts_with($s1, $s2) || str_starts_with($s2, $s1))));
+                            if (!empty($variant['name'])) {
+                                $n1 = strtolower(trim($v['name'] ?? ''));
+                                $n2 = strtolower(trim($variant['name'] ?? ''));
+                                $nameMatches = ($n1 === $n2 || ($n1 && $n2 && (str_contains($n1, $n2) || str_contains($n2, $n1))));
+                                return $sizeMatches && $nameMatches;
+                            }
+                            return $sizeMatches;
                         });
                     }
+                    // 3. Fallback to size-only match
                     if (!$liveVariant && !empty($variant['size']) && $variant['size'] !== '-') {
                         $liveVariant = collect($prodVariants)->first(function($v) use ($variant) {
                             $s1 = strtolower(trim($v['size'] ?? ''));
@@ -2327,25 +2373,40 @@ class SaleController extends Controller
                             return $s1 === $s2 || ($s1 && $s2 && (str_starts_with($s1, $s2) || str_starts_with($s2, $s1)));
                         });
                     }
+                    // 4. Fallback to name-only match ONLY if no size was specified
+                    if (!$liveVariant && !empty($variant['name']) && (empty($variant['size']) || $variant['size'] === '-')) {
+                        $liveVariant = collect($prodVariants)->first(function($v) use ($variant) {
+                            $n1 = strtolower(trim($v['name'] ?? ''));
+                            $n2 = strtolower(trim($variant['name'] ?? ''));
+                            return $n1 === $n2 || ($n1 && $n2 && (str_contains($n1, $n2) || str_contains($n2, $n1)));
+                        });
+                    }
+                    // 5. If only 1 variant exists
                     if (!$liveVariant && count($prodVariants) === 1) {
                         $liveVariant = $prodVariants[0];
                     }
                 }
             }
 
+            // CRITICAL: Determine Pack Size (pieces_per_box)
+            // Priority:
+            // 1. Permanent snapshot on SaleItem ($item->pieces_per_box)
+            // 2. Snapshot stored in variant JSON at time of sale
+            // 3. Live variant conv_factor / pieces_per_box
+            // 4. Product master pieces_per_box
             $ppb = 1;
-            if ($liveVariant && !empty($liveVariant['conv_factor']) && (float)$liveVariant['conv_factor'] > 0) {
+            if (!empty($item->pieces_per_box) && (float)$item->pieces_per_box > 0) {
+                $ppb = (float)$item->pieces_per_box;
+            } elseif (!empty($variant['conv_factor']) && (float)$variant['conv_factor'] > 0) {
+                $ppb = (float)$variant['conv_factor'];
+            } elseif (!empty($variant['pieces_per_box']) && (float)$variant['pieces_per_box'] > 0) {
+                $ppb = (float)$variant['pieces_per_box'];
+            } elseif ($liveVariant && !empty($liveVariant['conv_factor']) && (float)$liveVariant['conv_factor'] > 0) {
                 $ppb = (float)$liveVariant['conv_factor'];
             } elseif ($liveVariant && !empty($liveVariant['pieces_per_box']) && (float)$liveVariant['pieces_per_box'] > 0) {
                 $ppb = (float)$liveVariant['pieces_per_box'];
             } elseif ($item->product && (float)$item->product->pieces_per_box > 0) {
                 $ppb = (float)$item->product->pieces_per_box;
-            } elseif (!empty($variant['conv_factor']) && (float)$variant['conv_factor'] > 0) {
-                $ppb = (float)$variant['conv_factor'];
-            } elseif (!empty($variant['pieces_per_box']) && (float)$variant['pieces_per_box'] > 0) {
-                $ppb = (float)$variant['pieces_per_box'];
-            } elseif (!empty($item->pieces_per_box) && (float)$item->pieces_per_box > 0) {
-                $ppb = (float)$item->pieces_per_box;
             }
 
             if ($ppb <= 0) $ppb = 1;
@@ -2443,6 +2504,37 @@ class SaleController extends Controller
             // Delete master
             $voucher->delete();
         }
+
+        // 2b. Reverse and delete Journal Entries where source is the Sale itself (e.g. Manual Vendor Purchases & Payments)
+        $journalService->reverseEntriesForSource($sale);
+
+        // 2c. Reverse any POS Exchange Returns generated for this sale
+        $exchangeReturns = \App\Models\SaleReturn::where('remarks', 'like', "%Sales Invoice #{$sale->invoice_no}%")->get();
+        foreach ($exchangeReturns as $exReturn) {
+            $journalService->reverseEntriesForSource($exReturn);
+            // Reverse stock added by exchange return
+            $exItems = \App\Models\SaleReturnItem::where('sale_return_id', $exReturn->id)->get();
+            foreach ($exItems as $retItem) {
+                if (!$retItem->is_manual && $retItem->product_id) {
+                    $stock = \App\Models\WarehouseStock::where('warehouse_id', $retItem->warehouse_id ?? 1)
+                        ->where('product_id', $retItem->product_id)
+                        ->lockForUpdate()
+                        ->first();
+                    if ($stock) {
+                        $stock->total_pieces = max(0, $stock->total_pieces - (float)$retItem->qty);
+                        $retProd = \App\Models\Product::find($retItem->product_id);
+                        $rPpb = $retProd && $retProd->pieces_per_box > 0 ? $retProd->pieces_per_box : 1;
+                        $stock->quantity = round($stock->total_pieces / $rPpb, 2);
+                        $stock->save();
+                    }
+                }
+            }
+            \App\Models\SaleReturnItem::where('sale_return_id', $exReturn->id)->delete();
+            $exReturn->delete();
+        }
+
+        // 2d. Delete any CustomerPayment refund logged for POS exchange on this sale
+        \App\Models\CustomerPayment::where('note', 'like', "%Refund Paid for POS Exchange #{$sale->invoice_no}%")->delete();
 
         // 3. Rollback Legacy Customer Ledger & Customer Master Balance
         $ledgerEntries = \App\Models\CustomerLedger::where('customer_id', $sale->customer_id)
