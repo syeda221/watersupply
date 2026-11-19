@@ -356,18 +356,32 @@ class HomeController extends Controller
             }
             $profitThisMonth = $totalRevenueThisMonth - $totalCostThisMonth;
 
-            // Accurate Accounting Receivables & Payables in Single SQL Queries (Instant Execution)
-            $totalReceivables = DB::table('journal_entries')
-                ->where('party_type', \App\Models\Customer::class)
-                ->selectRaw('COALESCE(SUM(debit) - SUM(credit), 0) as total')
-                ->value('total') ?? 0;
+            // Accurate Accounting Receivables & Payables (Actual Positive Market Dues)
+            $arId = app(\App\Services\BalanceService::class)->getAccountsReceivableId();
+            $customerBalances = DB::table('customers')
+                ->leftJoin('journal_entries', function ($join) use ($arId) {
+                    $join->on('customers.id', '=', 'journal_entries.party_id')
+                        ->where('journal_entries.party_type', '=', \App\Models\Customer::class)
+                        ->where('journal_entries.account_id', '=', $arId);
+                })
+                ->select('customers.id', DB::raw('COALESCE(customers.opening_balance, 0) + COALESCE(SUM(journal_entries.debit) - SUM(journal_entries.credit), 0) as balance'))
+                ->groupBy('customers.id', 'customers.opening_balance')
+                ->get();
+
+            $totalReceivables = (float) $customerBalances->where('balance', '>', 0)->sum('balance');
 
             $apId = app(\App\Services\BalanceService::class)->getAccountsPayableId();
-            $totalPayables = DB::table('journal_entries')
-                ->where('party_type', \App\Models\Vendor::class)
-                ->where('account_id', $apId)
-                ->selectRaw('COALESCE(SUM(credit) - SUM(debit), 0) as total')
-                ->value('total') ?? 0;
+            $vendorBalances = DB::table('vendors')
+                ->leftJoin('journal_entries', function ($join) use ($apId) {
+                    $join->on('vendors.id', '=', 'journal_entries.party_id')
+                        ->where('journal_entries.party_type', '=', \App\Models\Vendor::class)
+                        ->where('journal_entries.account_id', '=', $apId);
+                })
+                ->select('vendors.id', DB::raw('COALESCE(vendors.opening_balance, 0) + COALESCE(SUM(journal_entries.credit) - SUM(journal_entries.debit), 0) as balance'))
+                ->groupBy('vendors.id', 'vendors.opening_balance')
+                ->get();
+
+            $totalPayables = (float) $vendorBalances->where('balance', '>', 0)->sum('balance');
 
             // Expenses Today
             $expensesTodayV1 = DB::table('expense_vouchers')->whereDate('entry_date', \Carbon\Carbon::today())->sum('total_amount');
